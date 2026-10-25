@@ -1,52 +1,47 @@
 {
-  "version": "1.0.0",
-  "skillHash": "sha256:4d93611fc1e7befb2700f2389b561735db4ead193bdffcc7787740e58e5b9133",
-  "scoredAt": "2026-05-13T09:57:02.464Z",
-  "backend": "subagent",
-  "model": "claude-sonnet-4-6",
+  "version": "1.1.0",
+  "skillHash": "sha256:d4c276d5ec152a83f03fde3dbbeb81a27b091a481ce71932368a8571bf0189e0",
+  "scoredAt": "2026-10-24T22:25:18.935Z",
+  "backend": "ollama",
+  "model": "gpt-oss:20b-64k",
   "quality": {
-    "score": 87,
+    "score": 100,
     "dimensions": {
-      "clarity": "WEAK",
-      "completeness": "WEAK",
+      "clarity": "PASS",
+      "completeness": "PASS",
       "conciseness": "PASS",
       "actionability": "PASS",
       "crossPlatform": "PASS",
       "examples": "PASS"
     },
-    "issues": [
-      {
-        "severity": "MEDIUM",
-        "category": "clarity",
-        "detail": "Instructions are not explicit, lacking step-by-step guidance."
-      },
-      {
-        "severity": "MEDIUM",
-        "category": "completeness",
-        "detail": "Examples do not cover error handling or edge cases."
-      }
-    ]
+    "issues": []
   },
   "security": {
     "verdict": "SAFE",
     "issues": []
   },
   "impact": {
-    "baselineAvg": 62,
-    "treatmentAvg": 88,
-    "multiplier": 1.42,
+    "multiplier": 3.8,
+    "baselineAvg": 25,
+    "treatmentAvg": 95,
     "scenarios": [
       {
-        "name": "Atomic publish-and-notify across two tables",
-        "baseline": 60,
-        "treatment": 88,
-        "rationale": "Treatment used prisma.$transaction with an array of prisma.post.update and prisma.notification.create so both succeed or roll back together; baseline issued two sequential awaits without transactional rollback."
+        "name": "setup-postgres-prisma-project",
+        "baseline": 0,
+        "treatment": 100,
+        "rationale": "Response A meets every rubric requirement; Response B omits key steps and dependencies."
       },
       {
-        "name": "Model blog schema with relations and ship migration",
-        "baseline": 65,
-        "treatment": 88,
-        "rationale": "Treatment delivered Prisma Schema Language with @relation, @@index on filtered fields, @@map, enum for Role, and the documented migrate dev / migrate deploy / generate sequence; baseline gave a usable schema but skipped @@index, @@map, and the dev-vs-deploy migration distinction."
+        "name": "upgrade-prisma-client-js-to-prisma7",
+        "baseline": 30,
+        "treatment": 85,
+        "rationale": "Response A covers all required steps except the explicit removal of prisma-client-js, while Response B lacks most of the detailed Prisma 7 setup."
+      },
+      {
+        "name": "run-migration-and-complex-query",
+        "baseline": 45,
+        "treatment": 100,
+        "rationale": "Response B fully satisfies all rubric requirements, while Response A misses several key elements."
       }
     ]
   }
