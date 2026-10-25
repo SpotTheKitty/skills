@@ -1,38 +1,36 @@
 ---
 title: "Build a Realtime Collaborative Editor"
 slug: build-realtime-collaborative-editor
-description: "Create a collaborative text editor where multiple users can edit documents simultaneously with live cursors, presence indicators, and conflict-free synchronization."
-skills: [websocket-builder, realtime-database, auth-system-setup]
+description: "Build self-hosted real-time co-editing with Yjs CRDTs and Hocuspocus: live cursors and presence, per-document roles, offline sync, PostgreSQL persistence, Redis scale-out, and a conflict-safe data model for non-text state like checklists."
+skills: [websocket-builder, realtime-database, auth-system-setup, yjs, typescript, zod, hono, postgresql, redis]
 category: development
-tags: [websocket, collaboration, realtime, editor, crdt, presence]
+tags: [websocket, collaboration, realtime, editor, crdt, presence, offline-first, yjs]
 ---
 
 # Build a Realtime Collaborative Editor
 
 ## The Problem
 
-Noa is building an internal knowledge base tool for her five-person engineering team. The key requirement: multiple people need to edit the same document at the same time, like Google Docs but self-hosted and private. Off-the-shelf solutions either cost $12/user/month (adds up fast as the company grows) or run on someone else's servers -- which fails the data residency requirements for their enterprise clients.
+Noa is building an internal knowledge base and task tool for her five-person engineering team. Several people must edit the same document at the same time, like Google Docs but self-hosted: hosted editors charge per seat, and some run on someone else's servers, which fails the data residency requirements of their enterprise clients.
 
-The real engineering challenge is conflict resolution. When two people type at the same position simultaneously, both edits need to survive. Naive approaches (last-write-wins, locking) either lose data or destroy the collaborative experience. Noa needs live cursors showing who is editing where, real-time text synchronization without conflicts, and user authentication so edits are attributed.
+The hard part is conflicts. With last-write-wins, whoever saves last destroys everyone else's work, and locking kills the collaborative feel. The team had also tried operational transforms (OT) and fought cursor jumps and lost characters. On top of conflict-free merging she needs live cursors and presence, access control per document (the WebSocket bypasses ordinary HTTP middleware), and offline editing, because some people work on trains and rooftops with no signal.
 
 ## The Solution
 
-Use **auth-system-setup** to handle user accounts and session management, **websocket-builder** to create the real-time communication layer between clients and server, and **realtime-database** to persist document state and sync changes across connected clients with conflict resolution.
+Conflict resolution is delegated to **yjs**, a CRDT library: copies of a document merge to the same result in any order, so the server has nothing to transform. Hocuspocus is the WebSocket server that speaks the Yjs sync protocol, and CodeMirror 6 is the editor. **auth-system-setup** covers accounts, sessions and document roles, **websocket-builder** the real-time layer (rooms, connection authentication, reconnects), and **hono** with **zod** the REST endpoint that issues short-lived collab tokens and validates untrusted data. **realtime-database** and **postgresql** persist document state as the system of record, **redis** fans updates out between several collab servers, and **typescript** types the document helpers.
 
 ## Step-by-Step Walkthrough
 
-### Step 1: Set Up Authentication and Document Permissions
+### Step 1: Set up authentication and document permissions
 
 ```text
 I need user authentication for the editor. Simple email + password login,
-JWT sessions, and document-level permissions: owner, editor, viewer.
-The owner can share documents with others and set their role. Use
+short-lived JWT access tokens, and document-level permissions: owner, editor,
+viewer. The owner can share documents with others and set their role. Use
 PostgreSQL for storage.
 ```
 
-Authentication is straightforward: email/password registration with bcrypt, JWT sessions with 24-hour expiry. Each user gets a randomly assigned avatar color from 12 distinct options -- these colors identify cursors in the editor later.
-
-Document access uses a simple permission model:
+Registration hashes passwords with a modern algorithm (argon2id or bcrypt), and the API issues a short-lived JWT whose `sub` is the user id. Roles:
 
 | Role | Read | Write | Share | Delete |
 |---|---|---|---|---|
@@ -40,172 +38,254 @@ Document access uses a simple permission model:
 | Editor | Yes | Yes | No | No |
 | Viewer | Yes | No | No | No |
 
+A `document_permissions(document_id, user_id, role)` table backs it. `POST /documents/:id/share` (owner only, body `{ email, role }`) creates a row, and a `requireDocumentAccess(minRole)` middleware returns 403 when the role is too low. The creator becomes the owner. The collaboration server checks the role again in Step 3.
+
+### Step 2: Issue collab tokens from the API
+
+The browser calls the REST API with its normal session and receives a token that lives five minutes. It uses that token to open the WebSocket, and the collab server re-checks the role on connect, so the token only proves who the user is.
+
 ```typescript
-// auth/permissions.ts — Document access control
+import { Hono } from 'hono'
+import { serve } from '@hono/node-server'
+import { zValidator } from '@hono/zod-validator'
+import { SignJWT } from 'jose'
+import { z } from 'zod'
 
-// POST /documents/:id/share — owner only
-// Body: { email: string, role: 'editor' | 'viewer' }
-// Looks up user by email, creates permission record
+const secret = new TextEncoder().encode(process.env.AUTH_JWT_SECRET)
+const app = new Hono<{ Variables: { userId: string; userName: string } }>()
 
-// Middleware: requireDocumentAccess(minRole)
-// Checks JWT → extracts user → queries document_permissions
-// Returns 403 if role is insufficient
+// Your session middleware sets userId / userName here.
+
+app.post('/documents/:id/collab-token',
+  zValidator('param', z.object({ id: z.uuid() })),
+  async (c) => {
+    const token = await new SignJWT({ name: c.get('userName') })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(c.get('userId'))
+      .setExpirationTime('5m')
+      .sign(secret)
+    return c.json({ token })
+  })
+
+serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 3000 })
 ```
 
-Document creation automatically assigns the creator as owner. The share endpoint lets owners invite collaborators by email and assign roles.
-
-### Step 2: Build the WebSocket Server for Real-Time Communication
+### Step 3: Build the collaboration server
 
 ```text
-Set up the WebSocket server. Each document is a "room" — when a user
-opens a document, they join that room. I need: connection authentication
-(verify JWT on connect), room management, and message routing so edits
-in one client reach all others in the same room instantly.
+Set up the WebSocket server. Each document is a room. I need connection
+authentication (verify the JWT and the user's role on connect), read-only
+enforcement for viewers, PostgreSQL as the system of record, and Redis so
+several server processes can share a document.
 ```
 
-Every document is a WebSocket room. When a user opens a document, the connection flow is:
-
-1. Client connects: `ws://host/ws?token=JWT&docId=abc123`
-2. Server verifies JWT (same key as HTTP auth)
-3. Server checks `document_permissions` for this user and document
-4. If authorized: join the room, broadcast a presence update to other editors
-5. If not: close connection with a 4403 code
-
-The room manager tracks connections per document:
+Hocuspocus rooms are named after the document id. The client sends its token in the protocol handshake (not in the URL, where it would end up in access logs), and `onAuthenticate` decides whether the connection lives. Setting `connectionConfig.readOnly` makes the server ignore that client's edits while it still receives everyone else's. Use a server that speaks the Yjs protocol rather than relaying raw bytes yourself: the handshake, awareness messages and read-only handling are what a hand-written relay gets wrong.
 
 ```typescript
-// ws/rooms.ts — Room management
+import { Server } from '@hocuspocus/server'
+import { Database } from '@hocuspocus/extension-database'
+import { Redis as HocuspocusRedis } from '@hocuspocus/extension-redis'
+import { jwtVerify } from 'jose'
+import pg from 'pg'
 
-// Map<documentId, Set<Connection>>
-// Connection: { ws, userId, displayName, avatarColor, role, cursor }
+const db = new pg.Pool({ connectionString: process.env.DATABASE_URL })
+const secret = new TextEncoder().encode(process.env.AUTH_JWT_SECRET)
 
-rooms.join(docId, connection);     // add to room, broadcast "user_joined"
-rooms.leave(docId, userId);        // remove from room, broadcast "user_left"
-rooms.broadcast(docId, message);   // send to all in room (optionally excluding sender)
+export const server = new Server({
+  address: '127.0.0.1',
+  port: Number(process.env.PORT ?? 1234),
+  debounce: 2000,     // save at most every 2 s after an edit
+  maxDebounce: 10000, // but never wait longer than 10 s under constant typing
+
+  // Runs on connect; throwing rejects the connection.
+  async onAuthenticate({ token, documentName, connectionConfig }) {
+    const { payload } = await jwtVerify(token, secret)
+    const { rows } = await db.query(
+      'SELECT role FROM document_permissions WHERE document_id = $1 AND user_id = $2',
+      [documentName, payload.sub],
+    )
+    if (!rows[0]) throw new Error('not allowed')
+    connectionConfig.readOnly = rows[0].role === 'viewer' // server drops this client's edits
+    return { user: { id: String(payload.sub), name: String(payload.name ?? payload.sub) } }
+  },
+
+  extensions: [
+    // Fan-out between several collab servers. Redis is NOT the system of record.
+    new HocuspocusRedis({ host: '127.0.0.1', port: 6379 }),
+    // PostgreSQL is.
+    new Database({
+      fetch: async ({ documentName }) =>
+        (await db.query('SELECT yjs_state FROM documents WHERE id = $1', [documentName]))
+          .rows[0]?.yjs_state ?? null,
+      store: async ({ documentName, state }) => {
+        await db.query(
+          `INSERT INTO documents (id, yjs_state, updated_at) VALUES ($1, $2, now())
+           ON CONFLICT (id) DO UPDATE SET yjs_state = $2, updated_at = now()`,
+          [documentName, state],
+        )
+      },
+    }),
+  ],
+})
+
+server.listen()
 ```
 
-Messages flow in both directions. Clients send operations (text changes), cursor positions, and selection ranges. The server relays operations to all other room members, sends presence updates, and provides a full document sync on initial connect.
+In a test with a server like this, an editor typed "hello " and another typed "world " at position 0 at the same moment. Both clients and a viewer converged on `world hello `, the viewer's attempted edit never reached the others, and a user without a role was rejected with `permission-denied`. Hocuspocus handles pings and reconnects on the provider side, so you do not hand-write heartbeats.
 
-A 30-second heartbeat catches disconnected clients. If a client misses 2 consecutive pongs, the server drops the connection and broadcasts a leave event.
+Redis is only the message bus. Do not make it the only copy of a document, because a default Redis install can lose recent writes on restart. Bind it to `127.0.0.1` (or a private network with a password); a single collab server needs no Redis at all.
 
-### Step 3: Implement Conflict-Free Document Synchronization
+### Step 4: Persist documents
 
-```text
-The hard part: when two people type at the same position simultaneously,
-the edits need to merge without losing either person's changes. Implement
-operational transformation or CRDTs — whichever is simpler for a text
-editor. Persist every operation so we have full history.
-```
-
-This is the hard part. Two approaches exist: Operational Transformation (OT) and CRDTs. OT requires a central transform server and gets complex fast. CRDTs (Conflict-free Replicated Data Types) are simpler -- merges are commutative, so the order operations arrive does not matter.
-
-The editor uses Yjs, a battle-tested CRDT library used by Notion, Jupyter, and others:
-
-```typescript
-// sync/crdt.ts — Yjs integration
-
-import * as Y from 'yjs';
-
-// One Y.Doc per document
-const doc = new Y.Doc();
-const yText = doc.getText('content');     // shared text, supports concurrent edits
-const yMeta = doc.getMap('metadata');     // title, last_modified, etc.
-```
-
-When two users type at the same position simultaneously -- say User A types "hello" and User B types "world" at position 0 -- the CRDT merges them deterministically by user ID order. No data lost, no manual conflict resolution needed.
-
-The server-side persistence layer:
-
-- **On client connect**: send the Y.Doc state as a sync step
-- **On client update**: apply to server Y.Doc, broadcast to room
-- **Periodic persistence**: debounced save to PostgreSQL every 2 seconds
-- **Full state save**: on last client disconnect
+CRDT merges are commutative, so there is no central transform server as in OT. The server keeps one `Y.Doc` per open document and the `Database` extension stores its encoded state:
 
 ```sql
--- Document storage
 CREATE TABLE documents (
-  id UUID PRIMARY KEY,
-  title TEXT,
-  yjs_state BYTEA,           -- compressed binary snapshot of Y.Doc
-  version INTEGER DEFAULT 0,
-  updated_at TIMESTAMPTZ
+  id         UUID PRIMARY KEY,
+  title      TEXT NOT NULL DEFAULT '',
+  yjs_state  BYTEA,                -- Y.encodeStateAsUpdate(doc)
+  updated_at TIMESTAMPTZ DEFAULT now()
 );
-
-CREATE TABLE document_updates (
-  id BIGSERIAL PRIMARY KEY,
+CREATE TABLE document_permissions (
   document_id UUID REFERENCES documents(id),
-  update_data BYTEA,          -- individual Y.Doc update
-  user_id UUID,
-  created_at TIMESTAMPTZ DEFAULT now()
+  user_id     UUID NOT NULL,
+  role        TEXT NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
+  PRIMARY KEY (document_id, user_id)
 );
 ```
 
-The `document_updates` table is an append-only log. Full edit history can be replayed by applying updates in order -- useful for "who changed this paragraph?" questions.
+`debounce` and `maxDebounce` control how often `store` runs, and the state is also written when the last client leaves. The single-state table keeps no history. For "who changed this paragraph", write periodic snapshots to a second table, or store each incoming update with its user id from an `onChange` hook.
 
-A major bonus: Yjs works offline. A client can edit while disconnected, and changes merge cleanly on reconnect. No special handling needed.
-
-### Step 4: Add Live Cursors and Presence Indicators
+### Step 5: Build the editor UI with presence and offline sync
 
 ```text
-Show each user's cursor position and selection in real time. Each user
-gets a unique color. Show a small name label next to each remote cursor.
-Also show a presence list in the sidebar — who's currently viewing the
-document and whether they're actively editing or idle.
+Create the frontend: document list sidebar, the collaborative editor in the
+center, presence panel on the right. Use CodeMirror 6 with markdown support.
+Show each user's cursor with a color and a name, and keep working offline.
 ```
 
-Live cursors make collaboration feel real. Each remote user's cursor is a 2px colored bar with a floating name label, rendered as CodeMirror 6 decorations:
-
-- **Cursor**: vertical bar in the user's avatar color
-- **Name label**: small floating div above the cursor with the user's name
-- **Selection**: semi-transparent highlight at 20% opacity
-- **Idle state**: cursors fade to 50% opacity after 5 seconds of no movement
-
-Cursor updates are throttled to 50ms intervals (20 updates/second). Selection changes send immediately. This keeps the experience smooth without overwhelming the WebSocket.
-
-The sidebar presence panel shows everyone currently in the document:
-
-- **Green dot**: actively editing
-- **Yellow dot**: idle for 30+ seconds
-- **Grey dot**: viewer (read-only access)
-- **Location hint**: "Editing near line 42"
-
-A 5-second grace period on disconnect prevents the presence list from flickering during page refreshes -- the user disappears from the list only if they do not reconnect within 5 seconds.
-
-### Step 5: Build the Editor UI with Document Management
-
-```text
-Create the frontend: a clean editor interface with a document list sidebar,
-the collaborative editor in the center, and the presence panel on the right.
-Use CodeMirror 6 for the editor. Add markdown support since our team writes
-docs in markdown.
-```
-
-The frontend uses React with CodeMirror 6 as the editor engine. The layout is a three-column CSS Grid:
-
-- **Left sidebar (240px)**: document list with search and "New Document" button
-- **Center (flex)**: CodeMirror editor, full height
-- **Right panel (200px)**: presence list and share button
-
-CodeMirror 6 extensions handle the heavy lifting:
+Use a three-column layout: document list, editor, presence and share button. Presence is Yjs awareness, a small state object each client publishes and the server relays; it is not stored in the document. The client sets `{ name, color }` under the `user` field and `y-codemirror.next` draws remote cursors, selections and name labels from it. Awareness comes from other browsers, so validate it with zod before rendering the sidebar.
 
 ```typescript
-// editor/codemirror-setup.ts
+import * as Y from 'yjs'
+import { HocuspocusProvider } from '@hocuspocus/provider'
+import { IndexeddbPersistence } from 'y-indexeddb'
+import { EditorView, basicSetup } from 'codemirror'
+import { EditorState } from '@codemirror/state'
+import { markdown } from '@codemirror/lang-markdown'
+import { yCollab } from 'y-codemirror.next'
+import { z } from 'zod'
 
-const extensions = [
-  markdown(),                         // syntax highlighting + preview
-  yCollab(yText, provider),          // Yjs collaboration binding
-  remoteCursors(),                   // renders other users' cursors
-  keymap.of([...defaultKeymap, ...markdownKeymap]),
-  customTheme,                       // clean typography, light theme
-];
+const Presence = z.object({
+  user: z.object({ name: z.string(), color: z.string() }),
+  lastActive: z.number().optional(),
+})
+
+export async function openEditor(parent: HTMLElement, docId: string,
+                                 me: { name: string; color: string }) {
+  const res = await fetch(`/documents/${docId}/collab-token`, { method: 'POST' })
+  const { token } = (await res.json()) as { token: string }
+
+  const ydoc = new Y.Doc()
+  const local = new IndexeddbPersistence(docId, ydoc) // edits survive reloads while offline
+  const provider = new HocuspocusProvider({
+    url: 'wss://docs.example.com/collab',             // your server, behind TLS
+    name: docId,
+    document: ydoc,
+    token,
+  })
+  provider.awareness?.setLocalStateField('user', me)
+
+  const ytext = ydoc.getText('content')
+  const undoManager = new Y.UndoManager(ytext)        // undoes only this user's edits
+  const view = new EditorView({
+    parent,
+    state: EditorState.create({
+      doc: ytext.toString(),
+      extensions: [basicSetup, markdown(), yCollab(ytext, provider.awareness, { undoManager })],
+    }),
+  })
+
+  // Sidebar: re-render on awareness 'change'; entries vanish when a client disconnects,
+  // or after 30 s of silence if it crashed.
+  const peers = () =>
+    [...(provider.awareness?.getStates().values() ?? [])]
+      .flatMap((s) => { const p = Presence.safeParse(s); return p.success ? [p.data] : [] })
+  return { view, provider, ydoc, local, peers }
+}
 ```
 
-The connection status bar at the bottom shows the current state: "Connected -- 3 collaborators" (green dot), "Reconnecting..." (yellow dot, auto-retry), or "Offline -- changes will sync when reconnected" (red dot). Yjs handles the offline case transparently -- edits queue locally and merge on reconnect.
+Edits are applied to the local document immediately and stored in IndexedDB; when the connection returns, the provider exchanges updates with the server and both sides converge. There is no separate "offline mode" to code. The provider's `onStatus` callback drives the status bar ("Connected", "Reconnecting...", "Offline, changes sync when reconnected"). "Active versus idle" is your own convention: publish a `lastActive` timestamp in the awareness state and grey out entries older than 30 seconds. A collab token expires after five minutes, so request a fresh one before reconnecting after a long offline period.
+
+### Step 6: Model non-text state so concurrent edits do not fight
+
+Text fields are `Y.Text`, which merges at character level. Structured state such as a task checklist needs more care. An array indexed by position makes two users who reorder or insert at once fight over indexes, and delete-and-reinsert reordering can duplicate or lose an item. Key items by id in a `Y.Map` and keep position in a numeric `order` field, in the same `Y.Doc` as the text:
+
+```typescript
+import * as Y from 'yjs'
+
+export const checklist = (doc: Y.Doc) => doc.getMap<Y.Map<unknown>>('checklist')
+
+export function addItem(doc: Y.Doc, text: string, assignee: string | null = null) {
+  const items = checklist(doc)
+  const last = Math.max(0, ...[...items.values()].map((i) => i.get('order') as number))
+  const item = new Y.Map<unknown>()
+  const id = crypto.randomUUID()
+  doc.transact(() => {
+    items.set(id, item)
+    item.set('text', text)
+    item.set('done', false)
+    item.set('assignee', assignee)
+    item.set('order', last + 1)
+  })
+  return id
+}
+
+// Set, don't toggle: two offline clients that both tick the box agree on `true`.
+export const setDone = (doc: Y.Doc, id: string, done: boolean) =>
+  checklist(doc).get(id)?.set('done', done)
+
+// Reorder by giving the item an order between its new neighbours. Concurrent moves of
+// the same item resolve to one of the two positions; nothing is duplicated or lost.
+export function moveBetween(doc: Y.Doc, id: string, before?: string, after?: string) {
+  const items = checklist(doc)
+  const o = (k?: string) => (k ? (items.get(k)?.get('order') as number) : undefined)
+  const lo = o(before) ?? (o(after) !== undefined ? o(after)! - 2 : 0)
+  const hi = o(after) ?? lo + 2
+  items.get(id)?.set('order', (lo + hi) / 2)
+}
+
+export const sorted = (doc: Y.Doc) =>
+  [...checklist(doc).entries()]
+    .map(([id, m]) => ({ id, ...(m.toJSON() as { text: string; done: boolean; order: number }) }))
+    .sort((a, b) => a.order - b.order)
+```
+
+Three choices matter. `setDone` sets a value instead of toggling, so two offline ticks agree on `true` where two toggles would cancel out. `moveBetween` changes one number instead of deleting and re-inserting, so a concurrent move cannot duplicate or lose the item. And everything arriving from other clients (awareness, request bodies) is parsed with zod before use.
+
+A test with two documents made offline edits on both sides: both ticked the same item, both moved the same item, and both typed at the start of the title. After exchanging updates (`Y.encodeStateAsUpdate` and `Y.applyUpdate`), the checklist was identical on both, the item appeared once, and the title was `v2 Release ` on both. Run the same test in your own suite. Bind `ydoc.getMap('checklist').observeDeep` to re-render the board, and pass both shared types to `Y.UndoManager`.
 
 ## Real-World Example
 
-Noa's five-person team sets up the self-hosted editor on a small VPS in a weekend. They start writing specs, runbooks, and design docs collaboratively. Live cursors make pair-writing unexpectedly fun -- two engineers can hammer out an API spec in real time, seeing each other's changes as they type.
+Noa's team deploys the editor on a small VPS in a weekend and starts writing specs, runbooks and design docs in it. Live cursors make pair-writing easy: two engineers draft an API spec together and watch each other's changes as they type. The contractors get viewer links that can read a runbook but not change it, because the server enforces the role, not just the UI.
 
-The CRDT earns its keep during an incident. Two engineers edit the same runbook simultaneously while troubleshooting a production issue -- one updating the timeline while the other documents the root cause. Their edits merge seamlessly with no conflicts and no coordination overhead.
+During an incident, two engineers edit the same runbook, one updating the timeline and the other writing down the root cause, and their edits merge with no coordination. A month later the team adds inspection checklists to the same tool. Dana, on a rooftop with no signal, ticks four items and adds two comments. Meanwhile the coordinator reorders the list and fixes a typo in the title. When Dana's phone reconnects, her ticks, the new order and the typo fix are all kept, and nobody sees a conflict dialog.
 
-The full edit history also proves useful. When a question arises about when a particular decision was documented in a design spec, the team replays the document history to the exact update. Total cost: one $5/month VPS instead of $60/month for a hosted collaboration tool.
+## Limits to plan for
+
+- A CRDT converges, but it does not know your business rules. Two people can assign the same item to different owners; the last write wins on that field. If that matters, show who assigned it and let people change it.
+- Deleted content is kept as tombstones until Yjs garbage collection compacts it, so test document size with your real edit volume before promising a limit.
+- Concurrent typing in one spot is merged at character level and can interleave two people's words. Cursors and presence make this rare in practice.
+- Scaling past one process needs the Redis extension; do not share document state yourself.
+
+## Related Skills
+
+- [auth-system-setup](/skills/auth-system-setup) - accounts, sessions and the owner/editor/viewer role model
+- [websocket-builder](/skills/websocket-builder) - rooms, connection authentication and reconnect handling
+- [realtime-database](/skills/realtime-database) - persisting document state
+- [yjs](/skills/yjs) - shared types, awareness and the offline provider
+- [typescript](/skills/typescript) - typed document helpers
+- [zod](/skills/zod) - validation of awareness and request data
+- [hono](/skills/hono) - REST API and collab token endpoint
+- [postgresql](/skills/postgresql) - durable document state and permissions
+- [redis](/skills/redis) - fan-out between collab servers
