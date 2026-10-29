@@ -4,6 +4,7 @@ slug: build-api-docs-and-testing-workflow
 description: "Generate accurate API documentation from code, test endpoints systematically, and validate payment integrations with realistic scenarios."
 skills:
   - openapi-spec
+  - scalar
   - api-tester
   - stripe-testing
 category: development
@@ -101,3 +102,7 @@ A payments platform had three partner companies struggling to integrate because 
 - Test with realistic payloads, not minimal valid objects. An endpoint that accepts a product with a 3-character name might break when someone submits a 500-character name with Unicode characters.
 - For Stripe testing, always test the webhook signature verification path. A common bug is accepting webhooks without verifying the signature, which allows attackers to forge events. Use `stripe.webhooks.constructEvent` on the raw request body, and test that a request with a wrong signature gets a 400.
 - Keep a separate test environment with its own Stripe test API keys. Sharing keys between developers causes test data collisions and flaky test results.
+
+## Related Skills
+
+- [scalar](/skills/scalar) — render the OpenAPI document as an interactive reference with a built-in request client, and lint it with the Scalar CLI

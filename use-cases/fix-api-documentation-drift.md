@@ -2,7 +2,7 @@
 title: "Fix API Documentation Drift with AI"
 slug: fix-api-documentation-drift
 description: "Detect and fix discrepancies between your API code and its OpenAPI documentation before they break client integrations."
-skills: [openapi-spec, api-tester, code-reviewer]
+skills: [openapi-spec, api-tester, code-reviewer, scalar]
 category: development
 tags: [api, documentation, openapi, drift-detection, developer-experience]
 ---
@@ -136,3 +136,7 @@ The breaking change review identified 2 changes requiring client notification, w
 The result: an accurate spec, two bugs caught, and client trust restored -- in under 20 minutes instead of a full day.
 
 The lasting fix was structural: the engineer added two CI steps on every PR that touches route or controller files. `npx @redocly/cli lint openapi.yaml` fails on an invalid spec, and `oasdiff breaking main:openapi.yaml openapi.yaml --fail-on ERR` fails when the PR introduces a breaking change that the spec does not call out. A scheduled job replays the api-tester checks against staging to catch code that diverges from a valid spec. Drift now fails the PR instead of reaching a client.
+
+## Related Skills
+
+- [scalar](/skills/scalar) — lint and preview the corrected OpenAPI spec (`scalar document lint`, `scalar document serve`) before merging
